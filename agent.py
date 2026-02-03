@@ -1,283 +1,248 @@
 import json
 import re
-import requests
-import datetime
-from llama_cpp import Llama
+import subprocess
 import os
 import sys
+import glob
+from typing import List, Dict, Any
 from dotenv import load_dotenv
+from llama_cpp import Llama
 
-# --- 1. CONFIGURAÇÃO ---
+# --- CONFIGURATION ---
 load_dotenv()
-
-# Caminhos configuráveis via .env ou fallback
 MODEL_PATH = os.getenv("MODEL_PATH")
-MCP_URL = os.getenv("MCP_URL", "http://localhost:8080/tools/call")
 N_CTX = 8192
 
-# Verificação básica do modelo
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ Erro: Modelo não encontrado em {MODEL_PATH}")
-    print("Edite o arquivo .env ou ajuste a variável MODEL_PATH.")
+if not MODEL_PATH or not os.path.exists(MODEL_PATH):
+    print(f"❌ Error: Model not found at {MODEL_PATH}")
+    print("Please set MODEL_PATH in your .env file.")
     sys.exit(1)
 
-print(f"⏳ Carregando modelo: {os.path.basename(MODEL_PATH)}...")
+# --- CORE AGENT ---
+class SkillAgent:
+    def __init__(self, model_path: str, n_ctx: int = 8192):
+        print(f"⏳ Loading model: {os.path.basename(model_path)}...")
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_gpu_layers=40, # Adjust based on your GPU
+            main_gpu=0,
+            n_threads=8,
+            verbose=False
+        )
+        self.history = []
+        self.loaded_skills = {} # name -> content
+        self.n_ctx = n_ctx
+    
+    # OBSIDIAN_VAULT_PATH needs to be accessible inside run()
+    OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "(Unknown - ask user if needed)")
 
-try:
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_ctx=N_CTX,
-        n_gpu_layers=40, # Ajuste conforme sua VRAM
-        main_gpu=0,
-        n_threads=8,
-        n_batch=1024,
-        offload_kqv=True,
-        mul_mat_q=True,
-        verbose=False 
-    )
-except Exception as e:
-    print(f"❌ Falha ao carregar modelo: {e}")
-    sys.exit(1)
+    def count_tokens(self, text: str) -> int:
+        return len(self.llm.tokenize(text.encode("utf-8")))
 
-# --- 2. CONFIGURAÇÃO DE FERRAMENTAS DINÂMICAS ---
+    def get_context_usage(self):
+        # Rough estimation of history + system prompt
+        total_tokens = sum(self.count_tokens(msg["content"]) for msg in self.history)
+        return total_tokens, self.n_ctx
 
-class ToolRegistry:
-    def __init__(self, mcp_url):
-        self.mcp_url = mcp_url
-        self.available_tools = [] # Cache de todas as ferramentas disponíveis no servidor
-        self.active_tools = {}    # Ferramentas atualmente carregadas no contexto do LLM
-        self.load_definitions()
-
-    def load_definitions(self):
-        """Busca todas as definições do servidor ao iniciar."""
+    # --- TOOLS (Programmatic) ---
+    def execute_shell(self, command: str) -> str:
+        """Executes a shell command and returns output."""
+        print(f"    > Executing: {command}")
         try:
-            response = requests.get(f"{self.mcp_url.replace('/tools/call', '/tools')}", timeout=10)
-            if response.status_code == 200:
-                self.available_tools = response.json()
-            else:
-                self.available_tools = [] 
+            result = subprocess.run(
+                command, 
+                shell=True, 
+                capture_output=True, 
+                text=True, 
+                timeout=60, # Increased timeout
+                executable="/bin/bash"
+            )
+            output = result.stdout
+            if result.stderr:
+                # Include stderr for debugging but don't fail just because of it (curl -v writes to stderr)
+                output += f"\n[STDERR]\n{result.stderr}"
+            
+            # Check return code
+            if result.returncode != 0:
+                output += f"\n[EXIT CODE] {result.returncode}"
+                
+            return output.strip() or "(No output)"
+        except subprocess.TimeoutExpired:
+            return f"Error: Command timed out after 60s. Command was: {command}"
         except Exception as e:
-            self.available_tools = []
-            
-        # Inicia APENAS com a ferramenta de busca de ferramentas
-        self.active_tools = {}
-        self.active_tools["search_tools"] = {
-            "name": "search_tools",
-            "description": "Busca ferramentas disponíveis no sistema baseada em uma query de busca.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Termo de busca para encontrar a ferramenta ideal."}
-                },
-                "required": ["query"]
+            return f"Error: {str(e)}"
+
+    def read_file(self, path: str) -> str:
+        """Reads a file from disk."""
+        try:
+            with open(path, "r") as f:
+                return f.read()
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+    def list_skills(self) -> List[str]:
+        """Lists available skills in the skills/ directory."""
+        skills = glob.glob("skills/*/SKILL.md")
+        return [p.split("/")[1] for p in skills]
+
+    def load_skill(self, name: str) -> str:
+        """Loads a skill's instructions into the context."""
+        path = f"skills/{name}/SKILL.md"
+        if not os.path.exists(path):
+            return f"Error: Skill '{name}' not found."
+        
+        content = self.read_file(path)
+        self.loaded_skills[name] = content
+        return f"Skill '{name}' loaded successfully. Instructions added to context."
+
+    def get_tools_schema(self):
+        """Returns the JSON schema for the core tools."""
+        return [
+            {
+                "name": "execute_shell",
+                "description": "Execute a CLI command in the system terminal.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The bash command to run."}
+                    },
+                    "required": ["command"]
+                }
+            },
+            {
+                "name": "read_file",
+                "description": "Read the content of a file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file."}
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "list_skills",
+                "description": "List available skills that can be loaded.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "load_skill",
+                "description": "Load a specific skill (documentation) into context.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The name of the skill (e.g., 'obsidian')."}
+                    },
+                    "required": ["name"]
+                }
             }
-        }
+        ]
 
-    def search(self, query):
-        """Busca por palavras-chave nas ferramentas disponíveis e as ativa."""
-        query_words = query.lower().split()
-        found = []
+    # --- MAIN LOOP ---
+    def run(self):
+        print("\n🚀 Skill-Based Agent Started. Type 'exit' to quit.")
         
-        for tool in self.available_tools:
-            name = tool.get("name", "").lower()
-            desc = tool.get("description", "").lower()
-            
-            if any(word in name or word in desc for word in query_words):
-                if tool["name"] not in self.active_tools:
-                    found.append(tool)
-                    self.active_tools[tool["name"]] = tool
-        
-        return found
-
-    
-
-    def get_prompt_definitions(self):
-        """Gera a string JSON para o System Prompt com as ferramentas ativas."""
-        return json.dumps(list(self.active_tools.values()), indent=2, ensure_ascii=False)
-
-# Inicializa o registro
-base_url = MCP_URL if "tools/call" in MCP_URL else f"{MCP_URL}/tools/call"
-registry = ToolRegistry(base_url)
-
-
-def get_system_prompt():
-    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    tools_json = registry.get_prompt_definitions()
-    
-    return f"""Você é um assistente integrado ao Obsidian.
-Data Atual: {current_date}
-
-FERRAMENTAS DISPONÍVEIS:
-{tools_json}
-
-INSTRUÇÕES:
-1. Analise a solicitação do usuário.
-2. Se as ferramentas listadas acima não forem suficientes, use 'search_tools' para descobrir novas capacidades.
-3. Se identificar a ferramenta correta (pela busca ou lista de sugestões), carregue-a e USE-A imediatamente para atender ao pedido. Não peça permissão para fazer o que foi solicitado.
-4. Utilize as tags <thought> para raciocinar antes de cada ação.
-5. Formato de chamada: <tool_call>{{"name": "...", "arguments": {{...}}}}</tool_call>
-"""
-
-# --- 3. FUNÇÕES AUXILIARES ---
-history = []
-
-def trim_history(max_messages=10):
-    global history
-    if len(history) > max_messages:
-        history = history[-max_messages:]
-
-def add_to_history(role, content):
-    history.append({"role": role, "content": content})
-
-def execute_tool_call(tool_call):
-
-    name = tool_call.get("name")
-
-    args = tool_call.get("arguments", {})
-
-    
-
-    print(f"⚙️  Tool: {name} {args}")
-
-    
-
-    # Intercepta a chamada local de 'search_tools'
-
-    if name == "search_tools":
-
-        query = args.get("keywords") or args.get("query")
-
-        results = registry.search(query)
-
-        
-
-        if not results:
-
-            # Fallback: Se não achou nada específico, lista os NOMES de tudo que existe
-
-            all_names = [t["name"] for t in registry.available_tools]
-
-            return f"Nenhuma ferramenta encontrada especificamente para '{query}'. Mas existem estas ferramentas no sistema: {all_names}. Tente buscar pelo nome de uma delas."
-
-            
-
-        return f"Novas ferramentas carregadas: {[t['name'] for t in results]}. Agora você pode usá-las."
-
-
-
-    # Chamadas remotas via MCP
-
-    try:
-
-        response = requests.post(MCP_URL, json=tool_call, timeout=30)
-
-        if response.status_code == 200:
-
-            return response.json()
-
-        else:
-
-            return {"error": f"HTTP {response.status_code}: {response.text}"}
-
-    except requests.RequestException as e:
-
-        return {"error": f"Connection Error: {str(e)}"}
-
-
-
-def parse_llm_response(text):
-    # Regex mais flexível para capturar o conteúdo mesmo se o LLM errar espaçamento
-    thought = re.search(r"<thought>(.*?)</thought>", text, re.DOTALL)
-    tool_call = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
-    answer = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-
-    parsed_thought = thought.group(1).strip() if thought else None
-    
-    if tool_call:
-        try:
-            # Tenta limpar o JSON (alguns LLMs colocam markdown ```json dentro da tag)
-            raw_json = tool_call.group(1).strip()
-            raw_json = re.sub(r"^```json", "", raw_json).replace("```", "").strip()
-            action = json.loads(raw_json)
-            return parsed_thought, action, "tool_call"
-        except json.JSONDecodeError:
-            return parsed_thought, {"error": "LLM gerou JSON inválido"}, "error"
-            
-    if answer:
-        return parsed_thought, answer.group(1).strip(), "answer"
-    
-    # Fallback: Se não tem tag de answer nem tool, assume que é resposta direta
-    if not tool_call and not answer:
-        return parsed_thought, text.replace(thought.group(0) if thought else "", "").strip(), "answer"
-        
-    return parsed_thought, None, "continue"
-
-# --- 4. LOOP PRINCIPAL ---
-if __name__ == "__main__":
-    print("\n🤖 Obsidian Agent Iniciado. Digite 'sair' para encerrar.")
-    
-    while True:
-        try:
-            user_input = input("\n👤 Você: ")
-            if user_input.lower() in ["sair", "exit", "quit"]: break
-            
-            add_to_history("user", user_input)
-            trim_history(15) 
-            
-            step = 0
-            MAX_STEPS = 5
-            
-            while step < MAX_STEPS:
-                system_prompt = get_system_prompt()
-                messages = [{"role": "system", "content": system_prompt}] + history
+        while True:
+            try:
+                # 1. Context Visualization
+                used, total = self.get_context_usage()
+                print(f"\n🧠 Context: {used}/{total} tokens ({used/total:.1%})")
                 
-                print("🤖 (Pensando...)")
-                output = llm.create_chat_completion(
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=1024,
-                    stop=["<|im_end|>", "<|endoftext|>"] # Stops comuns
-                )
-                
-                full_response = output["choices"][0]["message"]["content"]
-                thought, content, type_ = parse_llm_response(full_response)
-                
-                # Importante: Adiciona o que o LLM gerou ao histórico para ele "lembrar" do próprio raciocínio
-                add_to_history("assistant", full_response)
-
-                if thought:
-                    print(f"💭 {thought}")
-
-                if type_ == "tool_call":
-                    # Executa a ferramenta
-                    result = execute_tool_call(content)
-                    
-                    # TRUQUE: Devolvemos o resultado como uma mensagem de USUÁRIO.
-                    # Isso simula o ambiente devolvendo a informação.
-                    result_msg = f"RESULTADO DA FERRAMENTA ({content.get('name')}): {json.dumps(result, ensure_ascii=False)}"
-                    add_to_history("user", result_msg)
-                    
-                    step += 1
-                    continue # Volta para o início do loop para o LLM processar o resultado
-
-                elif type_ == "answer":
-                    print(f"🤖 {content}")
-                    break # Fim da resposta ao usuário
-                
-                elif type_ == "error":
-                    print("⚠️ Erro de parsing no LLM. Tentando recuperar...")
-                    add_to_history("user", "Erro: Você gerou um JSON inválido. Tente novamente.")
-                    step += 1
-                    continue
-                
-                else:
-                    # Se caiu aqui, é uma resposta sem tags (fallback)
-                    print(f"🤖 {content}")
+                # 2. User Input
+                user_input = input("👤 You: ")
+                if user_input.lower() in ["exit", "quit"]:
                     break
+                
+                self.history.append({"role": "user", "content": user_input})
+                
+                # 3. Generation Loop (Thought -> Tool -> Answer)
+                step = 0
+                max_steps = 10
+                
+                while step < max_steps:
+                    # Construct System Prompt
+                    skills_text = "\n\n".join([f"--- SKILL: {name} ---\n{content}" for name, content in self.loaded_skills.items()])
+                    
+                    system_prompt = f"""
+                    Você é um Assistente Avançado de IA com acesso a ferramentas locais.\n\nVARIÁVEIS DE AMBIENTE:\n- OBSIDIAN_VAULT_PATH: {self.OBSIDIAN_VAULT_PATH}\n\nFERRAMENTAS PRINCIPAIS:\n{json.dumps(self.get_tools_schema(), indent=2)}\n\nSKILLS CARREGADAS:\n{skills_text if skills_text else '(Nenhuma skill carregada. Use \'list_skills\' para descobrir capacidades.)'}\n\nINSTRUÇÕES:\n1. **CONSCIÊNCIA SITUACIONAL:** Para conversas gerais, responda naturalmente.\n2. **AÇÃO IMEDIATA:** Se o usuário pedir informações, busque-as e ENTREGUE o conteúdo final. Se encontrar um arquivo relevante, LEIA-O imediatamente com `read_file`. Não peça permissão para abrir arquivos que você localizou; seu objetivo é trazer a resposta pronta.\n3. **FLUXO DE DESCOBERTA:** Antes de dizer \"não sei\" ou pedir caminhos, use 'list_skills' para checar se há ferramentas relevantes (como 'obsidian' para notas). Se houver, use 'load_skill' e siga o manual.\n4. **FIDELIDADE DE BUSCA:** Ao buscar por algo, use os termos no idioma original do usuário. Considere que os arquivos podem estar em português ou inglês. Se a primeira busca falhar, tente sinônimos.\n5. **RACIOCÍNIO:** Use <thought>...</thought> para planejar. Explique por que você decidiu carregar uma skill ou fazer uma busca.\n6. **CHAMADA DE FERRAMENTA (IMPORTANTE):** 
+                    - Retorne APENAS o JSON cru dentro da tag.
+                    - NÃO use blocos de código markdown (```json).
+                    - Formato Obrigatório: <tool_call>{{"name": "nome_da_tool", "arguments": {{"arg1": "valor"}}}}</tool_call>
+                    """
+                    
+                    messages = [{"role": "system", "content": system_prompt}] + self.history[-15:] # Keep last 15 messages
+                    
+                    print("🤖 (Thinking...)")
+                    output = self.llm.create_chat_completion(
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=1024,
+                        stop=["<|im_end|>"]
+                    )
+                    
+                    response_text = output["choices"][0]["message"]["content"]
+                    self.history.append({"role": "assistant", "content": response_text})
+                    
+                    # Parse Response
+                    thought_match = re.search(r"<thought>(.*?)</thought>", response_text, re.DOTALL)
+                    tool_match = re.search(r"<tool_call>(.*?)</tool_call>", response_text, re.DOTALL)
+                    
+                    if thought_match:
+                        print(f"💭 {thought_match.group(1).strip()}")
+                    
+                    if tool_match:
+                        tool_json = tool_match.group(1).strip()
+                        # Cleanup markdown code blocks if present
+                        if tool_json.startswith("```"):
+                            tool_json = tool_json.split("\n", 1)[1].rsplit("\n", 1)[0]
+                        
+                        try:
+                            tool_call = json.loads(tool_json)
+                            name = tool_call["name"]; args = tool_call.get("arguments", {})
+                            
+                            # Log visual da chamada
+                            print(f"\n🛠️  Chamando ferramenta: {name}")
+                            if args: print(f"📦 Argumentos: {json.dumps(args, indent=2, ensure_ascii=False)}")
+                            
+                            result = "Unknown tool"
+                            if name == "execute_shell":
+                                result = self.execute_shell(args["command"])
+                            elif name == "read_file":
+                                result = self.read_file(args["path"])
+                            elif name == "list_skills":
+                                result = str(self.list_skills())
+                            elif name == "load_skill":
+                                result = self.load_skill(args["name"])
+                            
+                            print(f"⚙️  Result: {result[:200]}..." if len(result) > 200 else f"⚙️  Result: {result}")
+                            
+                            # Feed result back
+                            self.history.append({"role": "user", "content": f"TOOL RESULT ({name}): {result}"})
+                            step += 1
+                            continue
+                            
+                        except json.JSONDecodeError:
+                            print("❌ Error: Invalid JSON in tool call")
+                            self.history.append({"role": "user", "content": "Error: Invalid JSON in tool call."})
+                            continue
+                    
+                    # If no tool call, assume it's the answer
+                    if not tool_match:
+                        print(f"🤖 {response_text.replace(thought_match.group(0) if thought_match else '', '').strip()}")
+                        break
+                
+            except KeyboardInterrupt:
+                print("\nStopped.")
+                break
 
-            if step >= MAX_STEPS:
-                print("⚠️ Limite de passos atingido (Loop infinito evitado).")
+if __name__ == "__main__":
+    if not os.getenv("OBSIDIAN_API_TOKEN"):
+        print("⚠️  Warning: OBSIDIAN_API_TOKEN not set. Obsidian skill might fail.")
 
-        except KeyboardInterrupt:
-            print("\nParando...")
-            break
+    agent = SkillAgent(model_path=MODEL_PATH, n_ctx=N_CTX)
+    agent.run()

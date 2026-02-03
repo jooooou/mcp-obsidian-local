@@ -1,104 +1,87 @@
-# 🧠 Local Obsidian AI Agent (MVP)
+# 🧠 Local Obsidian AI Agent (Skills-Based)
 
-Este projeto implementa um **Agente de IA totalmente local** capaz de interagir com seu cofre (Vault) do Obsidian. Ele utiliza um modelo LLM rodando via `llama.cpp` para raciocinar (ReAct) e um servidor MCP (FastAPI) para executar ações reais nas suas notas.
+Este projeto implementa um **Agente de IA local autônomo** projetado para ser seu assistente pessoal dentro do Obsidian. Diferente de bots tradicionais, este agente utiliza uma arquitetura baseada em **Habilidades (Skills)**, inspirada em frameworks modernos como OpenClaw e Claude Code.
 
-> **⚠️ STATUS DO PROJETO: Alpha / Versão Básica**
-> Este é um MVP (Mínimo Produto Viável).
-> **Features:** Agente ReAct, Ferramentas de Leitura/Escrita no Obsidian.
-> **Stack:** Python, uv, Llama.cpp (GPU), FastAPI.
-
-## 📋 Pré-requisitos
-
-1.  **Gerenciador de Pacotes `uv`**: [Instalar uv](https://github.com/astral-sh/uv).
-2.  **Obsidian**: Com o plugin **Local REST API** instalado e ativo.
-3.  **Hardware**: Recomendado **GPU NVIDIA** (Drivers e CUDA Toolkit instalados).
-4.  **Make**: Ferramenta de build (padrão no Linux/WSL. No Windows, use WSL ou instale via chocolatey).
-5.  **Modelo GGUF**: Um modelo `.gguf` (Recomendado: *Qwen 2.5* ou *Llama 3.1* Instruct).
+O agente é capaz de ler suas notas, criar conteúdo, realizar buscas profundas no seu sistema de arquivos e executar comandos do Obsidian, tudo de forma local e privada.
 
 ---
 
-## 🛠️ Instalação Simplificada
+## 🏗️ Arquitetura do Sistema
 
-### 1. Configurar o Obsidian
-1.  No Obsidian, vá em **Settings > Community Plugins > Browse**.
-2.  Instale o plugin **Local REST API**.
-3.  Habilite o plugin e copie o **API Key** (Token).
+A arquitetura é dividida em dois componentes principais que trabalham em conjunto através de um loop de raciocínio (ReAct):
 
-### 2. Configurar o Projeto
-Este projeto usa um `Makefile` para garantir que o suporte a GPU seja compilado corretamente.
+### 1. O Núcleo do Agente (`agent.py`)
+O "cérebro" do sistema. Ele gerencia o modelo de linguagem (LLM) e a interface de execução.
+- **LLM Engine:** Utiliza `llama.cpp` para rodar modelos GGUF com aceleração de GPU.
+- **Programmatic Tool Calling:** O agente possui ferramentas "nativas" escritas em Python que ele pode invocar via JSON estruturado:
+    - `list_skills`: Lista os manuais de instruções disponíveis.
+    - `load_skill`: Carrega o manual de uma habilidade específica para o contexto da conversa.
+    - `execute_shell`: Permite ao agente rodar comandos Bash (como `curl`, `grep`, `ls`).
+    - `read_file`: Lê arquivos diretamente do disco.
+- **Context Management:** Monitora o uso de tokens e gerencia o histórico da conversa para manter o agente focado e dentro dos limites de memória do modelo.
 
-1.  Clone este repositório.
-2.  Execute a instalação:
+### 2. Sistema de Skills (`skills/`)
+As funcionalidades não são "hardcoded" no Python. Em vez disso, elas são definidas em arquivos Markdown (`SKILL.md`).
+- **Aprendizado Dinâmico:** O agente começa "limpo". Ao encontrar um problema, ele descobre que existe uma skill (ex: `obsidian`), lê o manual e aprende instantaneamente como usar ferramentas CLI (como `curl` contra a API do Obsidian) para resolver o pedido.
+- **Flexibilidade:** Adicionar novas capacidades (ex: integração com Git, Python REPL, Dataview) é tão simples quanto criar uma nova pasta com um arquivo Markdown explicativo.
 
-    ```bash
-    make install
-    ```
-    *Isso vai criar o ambiente virtual, baixar as libs e compilar o llama.cpp usando sua placa de vídeo.*
+---
 
-### 3. Configurar Variáveis (.env)
-Crie um arquivo `.env` na raiz:
+## 🛠️ Como as Ferramentas Funcionam
+
+### Fluxo de Execução (Loop ReAct)
+1.  **Pensamento (`<thought>`):** O modelo analisa o pedido do usuário e decide qual ferramenta ou skill é necessária.
+2.  **Chamada de Ferramenta (`<tool_call>`):** O modelo gera um JSON descrevendo a ação (ex: chamar `execute_shell` com um comando `curl`).
+3.  **Execução:** O `agent.py` intercepta esse JSON, executa o código Python ou o comando no terminal e captura o resultado (stdout/stderr).
+4.  **Observação:** O resultado é devolvido ao modelo como uma nova mensagem de contexto.
+5.  **Resposta Final:** O modelo processa o resultado e responde ao usuário ou decide que precisa de mais uma etapa de execução.
+
+### Integração com Obsidian
+O agente interage com o Obsidian de duas formas redundantes e robustas:
+- **API REST Local:** Via comandos `curl` documentados na Skill, o agente fala com o plugin *Obsidian Local REST API* para ações de interface (abrir notas, executar comandos do app).
+- **Acesso Direto ao Disco:** Para buscas full-text, o agente utiliza ferramentas nativas do Linux como `grep` e `ls` dentro da pasta definida pela variável `OBSIDIAN_VAULT_PATH`. Isso contorna limitações ou bugs de plugins de terceiros e garante velocidade instantânea.
+
+---
+
+## 📋 Instalação e Configuração
+
+### 1. Pré-requisitos
+- **Modelo GGUF:** Um modelo de instrução (Recomendado: Qwen 2.5 7B ou Llama 3.1 8B).
+- **Obsidian Plugin:** Instale e ative o plugin **Local REST API** no seu Obsidian.
+
+### 2. Configuração do Ambiente
+Crie um arquivo `.env` na raiz do projeto:
 
 ```ini
-# Obsidian Config (Local REST API)
-OBSIDIAN_API_URL=[http://127.0.0.1:27123](http://127.0.0.1:27123)
+# Caminho para o modelo GGUF
+MODEL_PATH=/caminho/para/seu/modelo.gguf
+
+# Configurações do Obsidian
 OBSIDIAN_API_TOKEN=seu_token_aqui
-
-# Caminho absoluto para seu modelo .gguf
-MODEL_PATH=/home/usuario/ai/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
-
-# Servidor MCP (Padrão)
-MCP_URL=http://localhost:8080/tools/call
-````
-
------
-
-## 🚀 Como Usar
-
-Abra dois terminais na pasta do projeto.
-
-**Terminal 1: Iniciar o Servidor**
-
-```bash
-make server
+OBSIDIAN_VAULT_PATH=/home/usuario/Documents/Vault
 ```
 
-**Terminal 2: Iniciar o Agente**
+### 3. Instalação
+```bash
+make install
+```
 
+---
+
+## 🚀 Uso
+
+Inicie o agente com o comando:
 ```bash
 make agent
 ```
 
-**Exemplo de interação:**
+### O que você pode pedir:
+- *"O que eu tenho anotado sobre o projeto X?"* (Ele vai buscar e ler a nota).
+- *"Adicione uma etapa de 'revisão final' na minha lista de tarefas de hoje."* (Ele vai localizar sua Daily Note e usar `PATCH` para editar).
+- *"Busque todas as notas que mencionam 'IA' e me dê um resumo."* (Ele vai usar `grep` recursivo e processar os arquivos).
 
-> **Você:** "Verifique se tenho alguma nota sobre 'Receitas' e, se não tiver, crie uma com uma lista de ingredientes para bolo."
->
-> **Agente:** (O agente vai buscar, não encontrar, e então criar a nota).
+---
 
------
-
-## 📦 Gestão de Dependências
-
-Se precisar adicionar novas bibliotecas (ex: numpy), use:
-
-```bash
-uv add numpy
-```
-
-*Nota: O `llama-cpp-python` não deve ser atualizado via `uv sync` puro para não perder o suporte a GPU. Se precisar reinstalá-lo, rode `make install` novamente.*
-
------
-
-## 🗺️ Roadmap
-
-  - [ ] **RAG (Memória):** Ler notas antigas para contexto.
-  - [ ] **Multi-Agentes:** Especialistas em tarefas distintas (escrita, organização, etc..)
-  - [ ] **Prompt Template:** Melhorar o System Prompt para evitar alucinações de JSON.
-  - [] **Criação de Tools** Capacidade de criar novas tools.
-  - [] **Interface de configuração** Jeito fácil de trocar prompts e modelos.
-
------
-
-## 🆘 Troubleshooting
-
-  * **Erro `make: command not found`**: Instale o pacote `build-essential` (Ubuntu/Debian) ou use WSL no Windows.
-  * **Lentidão Extrema**: Verifique se o modelo foi carregado na GPU olhando os logs do `make agent`. Se aparecer `BLAS = 0`, rode `make install` novamente.
+## 🛡️ Segurança e Privacidade
+- **100% Local:** Nada sai da sua máquina. O processamento da IA e o acesso aos arquivos são feitos localmente.
+- **Transparência:** O agente imprime no terminal cada comando que está executando, permitindo que você audite as ações em tempo real.
