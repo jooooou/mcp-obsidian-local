@@ -22,6 +22,98 @@ if not API_TOKEN:
     logger.critical("ERRO CRÍTICO: Token da API não encontrado. Verifique o arquivo .env")
     raise RuntimeError("OBSIDIAN_API_TOKEN não configurado no arquivo .env")
 
+# --- DEFINIÇÃO DE FERRAMENTAS (JSON SCHEMA) ---
+TOOL_DEFINITIONS = [
+    {
+        "name": "vault_list",
+        "description": "Lista todos os arquivos presentes no cofre (vault) do Obsidian.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "vault_read",
+        "description": "Lê o conteúdo de um arquivo Markdown específico.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "O caminho relativo do arquivo (ex: 'Pasta/Nota.md')"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "vault_write",
+        "description": "Substitui completamente o conteúdo de um arquivo existente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Caminho do arquivo"},
+                "content": {"type": "string", "description": "Novo conteúdo do arquivo"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "vault_create",
+        "description": "Cria um novo arquivo. Falha se o arquivo já existir.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Caminho do novo arquivo"},
+                "content": {"type": "string", "description": "Conteúdo inicial (opcional)"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "vault_delete",
+        "description": "Remove permanentemente um arquivo do cofre.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Caminho do arquivo a ser deletado"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "search",
+        "description": "Busca arquivos pelo nome (fuzzy) ou conteúdo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Termo de busca"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_daily_note",
+        "description": "Busca a nota diária correspondente a uma data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Data no formato YYYY-MM-DD"}
+            },
+            "required": ["date"]
+        }
+    },
+    {
+        "name": "execute_command",
+        "description": "Executa um comando interno do Obsidian pelo ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command_id": {"type": "string", "description": "ID do comando (ex: 'editor:toggle-bold')"}
+            },
+            "required": ["command_id"]
+        }
+    }
+]
+
 def call_obsidian_api(endpoint: str, method: str = "GET", data: dict = None, is_text: bool = False):
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
@@ -64,6 +156,11 @@ def call_obsidian_api(endpoint: str, method: str = "GET", data: dict = None, is_
         logger.error(f"Erro na API Obsidian: {error_detail}")
         raise HTTPException(status_code=500, detail=f"Obsidian API error: {error_detail}")
 
+@app.get("/tools")
+async def list_tools():
+    """Retorna a lista de ferramentas disponíveis e seus schemas."""
+    return TOOL_DEFINITIONS
+
 @app.post("/tools/call")
 async def call_tool(request: dict):
     name = request.get("name")
@@ -75,21 +172,25 @@ async def call_tool(request: dict):
             return call_obsidian_api("/vault/")
             
         elif name == "vault_read":
-            path = arguments.get("path")
+            path = arguments.get("path") or arguments.get("filename")
+            if not path: raise KeyError("path")
             return call_obsidian_api(f"/vault/{path}")
             
         elif name == "vault_write":
-            path = arguments.get("path")
+            path = arguments.get("path") or arguments.get("filename")
+            if not path: raise KeyError("path")
             content = arguments.get("content")
             return call_obsidian_api(f"/vault/{path}", "PUT", {"content": content}, is_text=True)
             
         elif name == "vault_create":
-            path = arguments.get("path")
+            path = arguments.get("path") or arguments.get("filename")
+            if not path: raise KeyError("path")
             content = arguments.get("content", "")
             return call_obsidian_api(f"/vault/{path}", "POST", {"content": content}, is_text=True)
             
         elif name == "vault_delete":
-            path = arguments.get("path")
+            path = arguments.get("path") or arguments.get("filename")
+            if not path: raise KeyError("path")
             return call_obsidian_api(f"/vault/{path}", "DELETE")
             
         elif name == "search":
@@ -112,22 +213,18 @@ async def call_tool(request: dict):
             for path in file_paths:
                 p_lower = str(path).lower()
                 
-                # A. Match direto (substring): "bolo" in "receita-de-bolo.md"
-                # Removemos traços e underlines para ajudar na comparação
+                # A. Match direto (substring)
                 p_clean = p_lower.replace("-", " ").replace("_", " ")
                 
                 score = 0
                 if q_lower in p_clean:
-                    score = 100 # Match muito forte
+                    score = 100 
                 else:
-                    # B. Match Fuzzy (Semelhança): "receita bollo" vs "receita-bolo"
-                    # SequenceMatcher calcula % de similaridade (0.0 a 1.0)
                     score = difflib.SequenceMatcher(None, q_lower, p_clean).ratio() * 100
                 
-                # Se a pontuação for boa (> 60%), adicionamos
                 if score > 60:
                     results.append({
-                        "filename": path,
+                        "path": path, # Mudado de filename para path
                         "score": score,
                         "match_type": "filename"
                     })

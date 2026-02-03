@@ -39,64 +39,151 @@ except Exception as e:
     print(f"❌ Falha ao carregar modelo: {e}")
     sys.exit(1)
 
-# --- 2. PROMPT DO SISTEMA ---
-functions_description = """
-- vault_list(): Lista arquivos no cofre. Retorna lista de caminhos.
-- vault_read(path): Lê o conteúdo de um arquivo Markdown.
-- vault_write(path, content): Cria ou substitui o conteúdo de um arquivo.
-- vault_delete(path): Remove um arquivo.
-- search(query): Busca arquivos pelo conteúdo.
-- get_daily_note(date): Busca a nota do dia. Formato da data: YYYY-MM-DD.
-"""
+# --- 2. CONFIGURAÇÃO DE FERRAMENTAS DINÂMICAS ---
+
+class ToolRegistry:
+    def __init__(self, mcp_url):
+        self.mcp_url = mcp_url
+        self.available_tools = [] # Cache de todas as ferramentas disponíveis no servidor
+        self.active_tools = {}    # Ferramentas atualmente carregadas no contexto do LLM
+        self.load_definitions()
+
+    def load_definitions(self):
+        """Busca todas as definições do servidor ao iniciar."""
+        try:
+            response = requests.get(f"{self.mcp_url.replace('/tools/call', '/tools')}", timeout=10)
+            if response.status_code == 200:
+                self.available_tools = response.json()
+            else:
+                self.available_tools = [] 
+        except Exception as e:
+            self.available_tools = []
+            
+        # Inicia APENAS com a ferramenta de busca de ferramentas
+        self.active_tools = {}
+        self.active_tools["search_tools"] = {
+            "name": "search_tools",
+            "description": "Busca ferramentas disponíveis no sistema baseada em uma query de busca.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Termo de busca para encontrar a ferramenta ideal."}
+                },
+                "required": ["query"]
+            }
+        }
+
+    def search(self, query):
+        """Busca por palavras-chave nas ferramentas disponíveis e as ativa."""
+        query_words = query.lower().split()
+        found = []
+        
+        for tool in self.available_tools:
+            name = tool.get("name", "").lower()
+            desc = tool.get("description", "").lower()
+            
+            if any(word in name or word in desc for word in query_words):
+                if tool["name"] not in self.active_tools:
+                    found.append(tool)
+                    self.active_tools[tool["name"]] = tool
+        
+        return found
+
+    
+
+    def get_prompt_definitions(self):
+        """Gera a string JSON para o System Prompt com as ferramentas ativas."""
+        return json.dumps(list(self.active_tools.values()), indent=2, ensure_ascii=False)
+
+# Inicializa o registro
+base_url = MCP_URL if "tools/call" in MCP_URL else f"{MCP_URL}/tools/call"
+registry = ToolRegistry(base_url)
+
 
 def get_system_prompt():
     current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    tools_json = registry.get_prompt_definitions()
     
-    return f"""Você é um assistente inteligente integrado ao Obsidian (software de notas).
+    return f"""Você é um assistente integrado ao Obsidian.
 Data Atual: {current_date}
 
-INSTRUÇÕES (ReAct Pattern):
-1. Analise o pedido do usuário.
-2. Pense passo a passo dentro de tags <thought>.
-3. SE precisar de dados externos, gere uma <tool_call>.
-4. Aguarde o resultado da ferramenta (que virá como mensagem de usuário).
-5. Quando tiver a informação ou tiver concluído a ação, responda com <answer>.
+FERRAMENTAS DISPONÍVEIS:
+{tools_json}
 
-FERRAMENTAS:
-{functions_description}
-
-EXEMPLO DE FLUXO:
-User: Crie uma nota 'Teste' com 'Ola'.
-Assistant: <thought>Devo criar um arquivo.</thought>
-<tool_call>{{"name": "vault_write", "arguments": {{"path": "Teste.md", "content": "Ola"}}}}</tool_call>
-User: RESULTADO DA FERRAMENTA: "Success"
-Assistant: <thought>Ação concluída. Vou avisar o usuário.</thought>
-<answer>Nota criada com sucesso!</answer>
+INSTRUÇÕES:
+1. Analise a solicitação do usuário.
+2. Se as ferramentas listadas acima não forem suficientes, use 'search_tools' para descobrir novas capacidades.
+3. Se identificar a ferramenta correta (pela busca ou lista de sugestões), carregue-a e USE-A imediatamente para atender ao pedido. Não peça permissão para fazer o que foi solicitado.
+4. Utilize as tags <thought> para raciocinar antes de cada ação.
+5. Formato de chamada: <tool_call>{{"name": "...", "arguments": {{...}}}}</tool_call>
 """
 
 # --- 3. FUNÇÕES AUXILIARES ---
 history = []
 
 def trim_history(max_messages=10):
-    """Mantém apenas as últimas N mensagens para não estourar o contexto."""
     global history
     if len(history) > max_messages:
-        # Mantém sempre a coerência removendo pares antigos, mas cuidado para não quebrar fluxos
         history = history[-max_messages:]
 
 def add_to_history(role, content):
     history.append({"role": role, "content": content})
 
 def execute_tool_call(tool_call):
-    print(f"⚙️  Tool: {tool_call.get('name')} {tool_call.get('arguments')}")
+
+    name = tool_call.get("name")
+
+    args = tool_call.get("arguments", {})
+
+    
+
+    print(f"⚙️  Tool: {name} {args}")
+
+    
+
+    # Intercepta a chamada local de 'search_tools'
+
+    if name == "search_tools":
+
+        query = args.get("keywords") or args.get("query")
+
+        results = registry.search(query)
+
+        
+
+        if not results:
+
+            # Fallback: Se não achou nada específico, lista os NOMES de tudo que existe
+
+            all_names = [t["name"] for t in registry.available_tools]
+
+            return f"Nenhuma ferramenta encontrada especificamente para '{query}'. Mas existem estas ferramentas no sistema: {all_names}. Tente buscar pelo nome de uma delas."
+
+            
+
+        return f"Novas ferramentas carregadas: {[t['name'] for t in results]}. Agora você pode usá-las."
+
+
+
+    # Chamadas remotas via MCP
+
     try:
+
         response = requests.post(MCP_URL, json=tool_call, timeout=30)
+
         if response.status_code == 200:
+
             return response.json()
+
         else:
+
             return {"error": f"HTTP {response.status_code}: {response.text}"}
+
     except requests.RequestException as e:
+
         return {"error": f"Connection Error: {str(e)}"}
+
+
 
 def parse_llm_response(text):
     # Regex mais flexível para capturar o conteúdo mesmo se o LLM errar espaçamento
