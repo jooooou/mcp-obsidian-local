@@ -9,7 +9,3 @@ install:
 # Atalho para rodar o agente
 agent:
 	uv run python agent.py
-
-# Atalho para rodar o servidor
-server:
-	uv run python obsidian_mcp_server.py
