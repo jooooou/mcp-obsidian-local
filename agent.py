@@ -4,6 +4,8 @@ import subprocess
 import os
 import sys
 import glob
+import time
+from datetime import datetime
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from llama_cpp import Llama
@@ -33,6 +35,11 @@ class SkillAgent:
         self.history = []
         self.loaded_skills = {} # name -> content
         self.n_ctx = n_ctx
+        
+        # Tracing Setup
+        self.trace_dir = f"traces/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        os.makedirs(self.trace_dir, exist_ok=True)
+        print(f"🕵️  Tracing enabled. Logs will be saved to: {self.trace_dir}")
     
     # OBSIDIAN_VAULT_PATH needs to be accessible inside run()
     OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "(Unknown - ask user if needed)")
@@ -44,6 +51,17 @@ class SkillAgent:
         # Rough estimation of history + system prompt
         total_tokens = sum(self.count_tokens(msg["content"]) for msg in self.history)
         return total_tokens, self.n_ctx
+
+    def log_trace(self, step_idx: int, event_type: str, payload: Any):
+        """Logs an event to a JSON file for the current step."""
+        filename = f"{self.trace_dir}/step_{step_idx:03d}.jsonl"
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event_type,
+            "data": payload
+        }
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     # --- TOOLS (Programmatic) ---
     def execute_shell(self, command: str) -> str:
@@ -146,6 +164,7 @@ class SkillAgent:
     # --- MAIN LOOP ---
     def run(self):
         print("\n🚀 Skill-Based Agent Started. Type 'exit' to quit.")
+        global_step_counter = 0 # Unique ID for each interaction step across the session
         
         while True:
             try:
@@ -165,17 +184,27 @@ class SkillAgent:
                 max_steps = 10
                 
                 while step < max_steps:
+                    global_step_counter += 1
+                    
                     # Construct System Prompt
                     skills_text = "\n\n".join([f"--- SKILL: {name} ---\n{content}" for name, content in self.loaded_skills.items()])
                     
                     system_prompt = f"""
-                    Você é um Assistente Avançado de IA com acesso a ferramentas locais.\n\nVARIÁVEIS DE AMBIENTE:\n- OBSIDIAN_VAULT_PATH: {self.OBSIDIAN_VAULT_PATH}\n\nFERRAMENTAS PRINCIPAIS:\n{json.dumps(self.get_tools_schema(), indent=2)}\n\nSKILLS CARREGADAS:\n{skills_text if skills_text else '(Nenhuma skill carregada. Use \'list_skills\' para descobrir capacidades.)'}\n\nINSTRUÇÕES:\n1. **CONSCIÊNCIA SITUACIONAL:** Para conversas gerais, responda naturalmente.\n2. **AÇÃO IMEDIATA:** Se o usuário pedir informações, busque-as e ENTREGUE o conteúdo final. Se encontrar um arquivo relevante, LEIA-O imediatamente com `read_file`. Não peça permissão para abrir arquivos que você localizou; seu objetivo é trazer a resposta pronta.\n3. **FLUXO DE DESCOBERTA:** Antes de dizer \"não sei\" ou pedir caminhos, use 'list_skills' para checar se há ferramentas relevantes (como 'obsidian' para notas). Se houver, use 'load_skill' e siga o manual.\n4. **FIDELIDADE DE BUSCA:** Ao buscar por algo, use os termos no idioma original do usuário. Considere que os arquivos podem estar em português ou inglês. Se a primeira busca falhar, tente sinônimos.\n5. **RACIOCÍNIO:** Use <thought>...</thought> para planejar. Explique por que você decidiu carregar uma skill ou fazer uma busca.\n6. **CHAMADA DE FERRAMENTA (IMPORTANTE):** 
+                    Você é um Assistente Avançado de IA com acesso a ferramentas locais.\n\nVARIÁVEIS DE AMBIENTE:\n- OBSIDIAN_VAULT_PATH: {self.OBSIDIAN_VAULT_PATH}\n\nFERRAMENTAS PRINCIPAIS:\n{json.dumps(self.get_tools_schema(), indent=2)}\n\nSKILLS CARREGADAS:\n{skills_text if skills_text else '(Nenhuma skill carregada. Você não sabe quais capacidades possui até usar list_skills.)'}\n\nINSTRUÇÕES:
+1. **CONSCIÊNCIA SITUACIONAL:** Para conversas gerais, responda naturalmente.\n2. **CAPACIDADES:** Suas funções não são fixas. Antes de responder que não consegue fazer algo, você deve primeiro usar `list_skills` para descobrir se existe uma habilidade disponível para aquela tarefa.\n3. **FLUXO DE DESCOBERTA:** Se identificar uma skill útil em `list_skills`, use `load_skill` para carregá-la e siga o manual de instruções contido nela.\n4. **PROATIVIDADE:** Se encontrar um arquivo relevante, LEIA-O imediatamente com `read_file`. Não peça permissão.\n5. **FIDELIDADE:** Ao realizar buscas, use os termos exatos fornecidos pelo usuário no idioma original dele.\n6. **RACIOCÍNIO:** Use <thought>...</thought> para planejar sua investigação. Se o usuário perguntar sobre uma capacidade, seu primeiro pensamento deve ser verificar as skills.\n7. **CHAMADA DE FERRAMENTA:** 
                     - Retorne APENAS o JSON cru dentro da tag.
-                    - NÃO use blocos de código markdown (```json).
-                    - Formato Obrigatório: <tool_call>{{"name": "nome_da_tool", "arguments": {{"arg1": "valor"}}}}</tool_call>
+                    - NÃO use blocos de código markdown.
+                    - Formato: <tool_call>{{"name": "...", "arguments": {{"arg": "valor"}}}}</tool_call>
                     """
                     
                     messages = [{"role": "system", "content": system_prompt}] + self.history[-15:] # Keep last 15 messages
+                    
+                    # --- TRACE START: Log Context ---
+                    self.log_trace(global_step_counter, "context", {
+                        "system_prompt_length": len(system_prompt),
+                        "loaded_skills": list(self.loaded_skills.keys()),
+                        "messages": messages
+                    })
                     
                     print("🤖 (Thinking...)")
                     output = self.llm.create_chat_completion(
@@ -186,6 +215,13 @@ class SkillAgent:
                     )
                     
                     response_text = output["choices"][0]["message"]["content"]
+                    
+                    # --- TRACE END: Log Response ---
+                    self.log_trace(global_step_counter, "generation", {
+                        "content": response_text,
+                        "token_usage": output.get("usage", {})
+                    })
+
                     self.history.append({"role": "assistant", "content": response_text})
                     
                     # Parse Response
@@ -221,6 +257,13 @@ class SkillAgent:
                             
                             print(f"⚙️  Result: {result[:200]}..." if len(result) > 200 else f"⚙️  Result: {result}")
                             
+                            # --- TRACE: Log Tool Result ---
+                            self.log_trace(global_step_counter, "tool_execution", {
+                                "tool": name,
+                                "arguments": args,
+                                "result": result
+                            })
+                            
                             # Feed result back
                             self.history.append({"role": "user", "content": f"TOOL RESULT ({name}): {result}"})
                             step += 1
@@ -229,6 +272,7 @@ class SkillAgent:
                         except json.JSONDecodeError:
                             print("❌ Error: Invalid JSON in tool call")
                             self.history.append({"role": "user", "content": "Error: Invalid JSON in tool call."})
+                            self.log_trace(global_step_counter, "error", {"message": "Invalid JSON in tool call"})
                             continue
                     
                     # If no tool call, assume it's the answer
